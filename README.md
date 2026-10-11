@@ -1,6 +1,6 @@
 # Clustering Algorithm comparation
 
-This project implements the different clustering algorithm and compares it
+This project implements different clustering algorithms and compares them
 with each other.
 
 ## Setup
