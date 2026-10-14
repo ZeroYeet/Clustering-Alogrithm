@@ -1,3 +1,4 @@
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -5,11 +6,15 @@ import numpy as np
 import pytest
 
 import benchmark_data
-import mw_kmeans
+import model.evaluate_classic_kmeans as evaluate_classic_kmeans
+import evaluate_all_models as evaluate_all_models
+import model.mw_kmeans as mw_kmeans
+import model.evaluate_dca as evaluate_dca
 from benchmark_data import expand_dataset_selection
-from evaluate_classic_kmeans import evaluate_dataset as evaluate_classic_dataset
-from evaluate_mw_kmeans import RESULTS_DIR, evaluate_dataset, save_csv, save_plot
-from mw_kmeans import MWKMeans
+from model.evaluate_classic_kmeans import evaluate_dataset as evaluate_classic_dataset
+from model.evaluate_dca import evaluate_dataset as evaluate_dca_dataset
+from model.evaluate_mw_kmeans import RESULTS_DIR, evaluate_dataset, save_csv, save_plot
+from model.mw_kmeans import MWKMeans
 
 
 def test_mw_kmeans_clusters_two_blobs():
@@ -254,6 +259,114 @@ def test_load_openml_yeast_dataset_by_fixed_id(monkeypatch):
     np.testing.assert_array_equal(loaded_labels, labels)
 
 
+def test_load_csv_dataset_from_url(monkeypatch):
+    response = BytesIO(b"feature_a,feature_b,class\n0,10,alpha\n5,20,beta\n10,30,alpha\n")
+    calls = []
+
+    def fake_urlopen(url, timeout):
+        calls.append((url, timeout))
+        return response
+
+    monkeypatch.setattr(benchmark_data, "urlopen", fake_urlopen)
+    features, labels = benchmark_data.load_benchmark_data(
+        url="https://example.com/data.csv"
+    )
+
+    assert calls == [("https://example.com/data.csv", 30)]
+    np.testing.assert_allclose(features, [[0, 0], [0.5, 0.5], [1, 1]])
+    np.testing.assert_array_equal(labels, ["alpha", "beta", "alpha"])
+
+
+def test_load_csv_preprocesses_categorical_missing_and_identifier_columns(monkeypatch):
+    response = BytesIO(
+        b"User ID,Gender,Age,EstimatedSalary,Purchased\n"
+        b"15624510,Male,19,19000,0\n"
+        b"15810944,Female,35,?,1\n"
+        b"15668575,Male,26,43000,0\n"
+        b"15603246,Female,27,57000,1\n"
+    )
+    def fake_urlopen(url, timeout):
+        assert url == "https://example.com/Social_Network_Ads.csv"
+        assert timeout == 30
+        return response
+
+    monkeypatch.setattr(benchmark_data, "urlopen", fake_urlopen)
+
+    features, labels = benchmark_data.load_benchmark_data(
+        url="https://example.com/Social_Network_Ads.csv",
+        target_column="Purchased",
+    )
+
+    assert features.shape == (4, 4)
+    assert np.isfinite(features).all()
+    np.testing.assert_allclose(features.min(axis=0), 0)
+    np.testing.assert_allclose(features.max(axis=0), 1)
+    np.testing.assert_array_equal(labels, ["0", "1", "0", "1"])
+
+
+def test_load_csv_supports_semicolon_delimiter_and_target_index(monkeypatch):
+    response = BytesIO(b"red;1;A\nblue;3;B\nred;2;A\n")
+
+    def fake_urlopen(url, timeout):
+        assert url == "https://example.com/data.csv"
+        assert timeout == 30
+        return response
+
+    monkeypatch.setattr(benchmark_data, "urlopen", fake_urlopen)
+
+    features, labels = benchmark_data.load_benchmark_data(
+        url="https://example.com/data.csv",
+        target_column="2",
+        has_header=False,
+    )
+
+    assert features.shape == (3, 3)
+    np.testing.assert_array_equal(labels, ["A", "B", "A"])
+
+
+def test_load_csv_dataset_from_url_rejects_non_http_urls():
+    with pytest.raises(ValueError, match="HTTP or HTTPS"):
+        benchmark_data.load_benchmark_data(url="file:///local/data.csv")
+
+
+def test_dca_evaluates_dataset_with_ground_truth_cluster_count(monkeypatch):
+    features = np.array([[0.0], [0.1], [0.9], [1.0]])
+    labels = np.array(["left", "left", "right", "right"])
+    calls = []
+
+    def fake_load_benchmark_data(
+        dataset_name, url=None, target_column=None, has_header=None
+    ):
+        assert dataset_name == "custom"
+        assert url == "https://example.com/data.csv"
+        assert target_column is None
+        assert has_header is None
+        return features, labels
+
+    monkeypatch.setattr(
+        evaluate_dca, "load_benchmark_data", fake_load_benchmark_data
+    )
+
+    def fake_ip_dca(X, **kwargs):
+        calls.append((X, kwargs))
+        return {"labels": np.array([0, 0, 1, 1]), "iterations": 7}
+
+    monkeypatch.setattr(evaluate_dca, "ip_dca", fake_ip_dca)
+    result = evaluate_dca_dataset("custom", dataset_url="https://example.com/data.csv")
+
+    assert calls[0][1] == {
+        "n_clusters": 2,
+        "t": 10.0,
+        "max_iter": 1000,
+        "tol": 1e-6,
+        "random_state": 42,
+    }
+    assert result["dataset"] == "custom"
+    assert result["samples"] == 4
+    assert result["iterations"] == 7
+    assert result["accuracy_percent"] == 100.0
+
+
 def test_both_evaluators_run_openml_yeast_without_network(monkeypatch):
     rng = np.random.default_rng(17)
     features = rng.random((1484, 8))
@@ -302,6 +415,151 @@ def test_classic_kmeans_rejects_invalid_n_init():
         assert "n_init must be positive" in str(error)
     else:
         raise AssertionError("Expected ValueError for n_init=0")
+
+
+def test_classic_evaluator_uses_project_kmeans_and_selects_best_restart(monkeypatch):
+    features = np.array([[0.0], [0.1], [0.9], [1.0]])
+    labels = np.array(["left", "left", "right", "right"])
+    calls = []
+    monkeypatch.setattr(
+        evaluate_classic_kmeans,
+        "load_benchmark_data",
+        lambda dataset_name, **kwargs: (features, labels),
+    )
+
+    def fake_kmeans(X, k, max_iter, random_state):
+        calls.append((X, k, max_iter, random_state))
+        if random_state == 11:
+            return {
+                "labels": np.array([1, 1, 0, 0]),
+                "inertia": 0.1,
+                "iterations": 3,
+            }
+        return {
+            "labels": np.array([0, 1, 0, 1]),
+            "inertia": 2.0,
+            "iterations": 2,
+        }
+
+    monkeypatch.setattr(evaluate_classic_kmeans, "kmeans", fake_kmeans)
+    result = evaluate_classic_dataset(
+        "custom",
+        n_init=2,
+        random_state=10,
+        max_iter=50,
+    )
+
+    assert [call[1:] for call in calls] == [(2, 50, 10), (2, 50, 11)]
+    assert result["iterations"] == 3
+    assert result["accuracy_percent"] == 100.0
+
+
+def test_combined_evaluator_runs_all_models_on_one_loaded_dataset(monkeypatch):
+    features = np.array([[0.0], [0.1], [0.9], [1.0]])
+    labels = np.array(["left", "left", "right", "right"])
+    load_calls = []
+    model_calls = []
+
+    def fake_load(dataset_name, **kwargs):
+        load_calls.append((dataset_name, kwargs))
+        return features, labels
+
+    class FakeMWKMeans:
+        def __init__(self, **kwargs):
+            model_calls.append(("MW-K-means", kwargs))
+            self.n_iter_ = 4
+
+        def fit(self, X):
+            return self
+
+        def fit_predict(self, X):
+            return np.array([0, 0, 1, 1])
+
+    def fake_kmeans(X, **kwargs):
+        model_calls.append(("K-means", kwargs))
+        return {
+            "labels": np.array([1, 1, 0, 0]),
+            "inertia": 0.1,
+            "iterations": 3,
+        }
+
+    def fake_ip_dca(X, **kwargs):
+        model_calls.append(("DCA", kwargs))
+        return {"labels": np.array([0, 0, 1, 1]), "iterations": 5}
+
+    monkeypatch.setattr(evaluate_all_models, "load_benchmark_data", fake_load)
+    monkeypatch.setattr(evaluate_all_models, "MWKMeans", FakeMWKMeans)
+    monkeypatch.setattr(evaluate_all_models, "kmeans", fake_kmeans)
+    monkeypatch.setattr(evaluate_all_models, "ip_dca", fake_ip_dca)
+
+    results = evaluate_all_models.evaluate_dataset(
+        "custom",
+        dataset_url="https://example.com/data.csv",
+        target_column="class",
+        n_init=1,
+    )
+
+    assert len(load_calls) == 1
+    assert [result["model"] for result in results] == [
+        "MW-K-means",
+        "K-means",
+        "DCA",
+    ]
+    assert all(result["samples"] == 4 for result in results)
+    assert [result["iterations"] for result in results] == [4, 3, 5]
+
+
+def test_combined_csv_contains_all_models_in_one_file(tmp_path):
+    rows = [
+        {
+            "model": model,
+            **{
+                field: (
+                    "iris"
+                    if field == "dataset"
+                    else 4
+                    if field in {"features", "iterations"}
+                    else 0
+                )
+                for field in evaluate_all_models.METRIC_FIELDS
+            },
+        }
+        for model in ("MW-K-means", "K-means", "DCA")
+    ]
+    output_path = tmp_path / "results" / "all_models.csv"
+
+    evaluate_all_models.save_combined_csv(rows, output_path)
+
+    exported = output_path.read_text(encoding="utf-8").splitlines()
+    assert exported[0].startswith("model,dataset,samples,features,")
+    assert ",ari," not in exported[0]
+    assert ",nmi," not in exported[0]
+    assert [row.split(",")[0] for row in exported[1:]] == [
+        "MW-K-means",
+        "K-means",
+        "DCA",
+    ]
+
+
+def test_combined_plot_exports_png_without_ari_or_nmi(tmp_path):
+    rows = [
+        {
+            "model": model,
+            "dataset": "iris",
+            "accuracy_percent": 80.0,
+            "precision_macro_percent": 79.0,
+            "recall_macro_percent": 78.0,
+            "f1_macro_percent": 77.0,
+            "runtime_seconds": 0.01,
+        }
+        for model in ("MW-K-means", "K-means", "DCA")
+    ]
+    output_path = tmp_path / "charts" / "combined.png"
+
+    evaluate_all_models.save_combined_plot(rows, output_path)
+
+    assert output_path.is_file()
+    assert output_path.stat().st_size > 0
 
 
 def test_save_csv_exports_evaluation_metrics(tmp_path):

@@ -22,7 +22,7 @@ from benchmark_data import (
     expand_dataset_selection,
     load_benchmark_data,
 )
-from mw_kmeans import MWKMeans
+from model.mw_kmeans import MWKMeans
 
 
 METRIC_FIELDS = (
@@ -40,12 +40,15 @@ METRIC_FIELDS = (
     "runtime_seconds",
     "iterations",
 )
-RESULTS_DIR = Path(__file__).resolve().parent / "results"
+RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 
 
 def evaluate_dataset(
     dataset_name: str,
     *,
+    dataset_url: str | None = None,
+    target_column: str | None = None,
+    has_header: bool | None = None,
     beta: float = 0.05,
     theta: float = 0.5,
     max_iter: int = 300,
@@ -53,7 +56,12 @@ def evaluate_dataset(
     random_state: int = 42,
 ) -> dict[str, Any]:
     """Fit MW-K-means on a benchmark dataset and return clustering metrics."""
-    features, true_labels = load_benchmark_data(dataset_name)
+    features, true_labels = load_benchmark_data(
+        dataset_name,
+        url=dataset_url,
+        target_column=target_column,
+        has_header=has_header,
+    )
     model = MWKMeans(
         n_clusters=len(np.unique(true_labels)),
         beta=beta,
@@ -267,11 +275,25 @@ def main() -> None:
             "Evaluate MW-K-means on Iris, Wine, Breast Cancer, and OpenML Yeast."
         )
     )
-    parser.add_argument(
+    dataset_group = parser.add_mutually_exclusive_group()
+    dataset_group.add_argument(
         "--dataset",
         choices=DATASET_SELECTIONS,
         default="all",
-        help="Dataset to evaluate, or all available datasets (default: all).",
+        help="Built-in dataset to evaluate, or all available datasets (default: all).",
+    )
+    dataset_group.add_argument(
+        "--dataset-url",
+        help="Direct HTTP(S) URL to a tabular CSV dataset.",
+    )
+    parser.add_argument(
+        "--target-column",
+        help="Target column name or zero-based index (default: last column).",
+    )
+    parser.add_argument(
+        "--no-header",
+        action="store_true",
+        help="Treat the CSV as headerless (useful for categorical data without headers).",
     )
     parser.add_argument("--beta", type=float, default=0.05)
     parser.add_argument("--theta", type=float, default=0.5)
@@ -281,32 +303,50 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=RESULTS_DIR / "results.csv",
-        help=f"CSV output path (default: {RESULTS_DIR / 'results.csv'}).",
+        default=RESULTS_DIR / "mw_kmeans_results.csv",
+        help=f"CSV output path (default: {RESULTS_DIR / 'mw_kmeans_results.csv'}).",
     )
     parser.add_argument(
         "--plot",
         type=Path,
-        default=RESULTS_DIR / "results.png",
+        default=RESULTS_DIR / "mw_kmeans_results.png",
         help=(
             "Chart output path (PNG, SVG, or PDF); "
-            f"default: {RESULTS_DIR / 'results.png'}."
+            f"default: {RESULTS_DIR / 'mw_kmeans_results.png'}."
         ),
     )
     args = parser.parse_args()
 
-    dataset_names = expand_dataset_selection(args.dataset)
-    results = [
-        evaluate_dataset(
-            name,
-            beta=args.beta,
-            theta=args.theta,
-            max_iter=args.max_iter,
-            n_init=args.n_init,
-            random_state=args.random_state,
-        )
-        for name in dataset_names
-    ]
+    if not args.dataset_url and (args.target_column is not None or args.no_header):
+        parser.error("--target-column and --no-header require --dataset-url")
+
+    if args.dataset_url:
+        results = [
+            evaluate_dataset(
+                "custom",
+                dataset_url=args.dataset_url,
+                target_column=args.target_column,
+                has_header=False if args.no_header else None,
+                beta=args.beta,
+                theta=args.theta,
+                max_iter=args.max_iter,
+                n_init=args.n_init,
+                random_state=args.random_state,
+            )
+        ]
+    else:
+        dataset_names = expand_dataset_selection(args.dataset)
+        results = [
+            evaluate_dataset(
+                name,
+                beta=args.beta,
+                theta=args.theta,
+                max_iter=args.max_iter,
+                n_init=args.n_init,
+                random_state=args.random_state,
+            )
+            for name in dataset_names
+        ]
     print_results(results)
     save_csv(results, args.output)
     print(f"\nCSV exported to: {args.output}")
