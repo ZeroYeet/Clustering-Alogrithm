@@ -45,10 +45,11 @@ def evaluate_dataset(
         algorithm="lloyd",
     )
 
-    start = time.perf_counter()
     with threadpool_limits(limits=1):
+        model.fit(features)
+        start = time.perf_counter()
         predicted_clusters = model.fit_predict(features)
-    runtime_seconds = time.perf_counter() - start
+        runtime_seconds = time.perf_counter() - start
 
     return score_clustering(
         dataset_name,

@@ -5,7 +5,6 @@ import csv
 import time
 from pathlib import Path
 from typing import Any
-
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -65,6 +64,7 @@ def evaluate_dataset(
         random_state=random_state,
     )
 
+    model.fit(features)
     start = time.perf_counter()
     predicted_clusters = model.fit_predict(features)
     runtime_seconds = time.perf_counter() - start
